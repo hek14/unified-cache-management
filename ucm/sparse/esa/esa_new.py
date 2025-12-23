@@ -16,6 +16,7 @@ import esa_interface as esa_lib
 esa_retrieval = esa_lib.esa_retrieval
 esa_repre = esa_lib.esa_repre
 esa_copy = esa_lib.esa_copy
+esa_scatter_copy = esa_lib.esa_scatter_copy
 
 
 class ReprePool:
@@ -44,9 +45,16 @@ class ESA(UcmSparseBase):
         self.dtype = model_config.dtype
 
         max_num_blocks = model_config.max_model_len * vllm_config.scheduler_config.max_num_seqs // vllm_config.cache_config.block_size
+
+        shape = (1000, self.block_size, model_config.get_num_kv_heads(parallel_config), model_config.get_head_size()) # TODO:从config里拿到实际的blocks数量*3
+        self.host_kv_cache = [
+            torch.zeros(shape, dtype=self.dtype, device="cpu", pin_memory=True)
+            for _ in range(self.total_num_hidden_layers)
+        ]
+
         shape = (max_num_blocks, model_config.get_num_kv_heads(parallel_config), model_config.get_head_size())
         self.repre_cache = [
-            torch.zeros(shape, dtype=model_config.dtype, device=self.device)
+            torch.zeros(shape, dtype=self.dtype, device=self.device)
             for _ in range(self.total_num_hidden_layers)
         ]
         self.repre_pool = ReprePool(max_num_blocks)
@@ -109,31 +117,33 @@ class ESA(UcmSparseBase):
     def build_sparse_meta(
         self, scheduler_output, requests, input_batch, attn_metadata
         ):
+        return
         # TODO: handle preemption
-        if isinstance(attn_metadata, dict):
-            attn_metadata = next(iter(attn_metadata.values()))
-        self.attn_metadata = attn_metadata
-        prefill_offset = 0
-        for (req_id, num_scheduled_tokens) in scheduler_output.num_scheduled_tokens.items():
-            req = requests[req_id]
-            is_decode = len(req.output_token_ids) > 0 # 抢占时不成立, FIXME
-            is_last_chunk = (not is_decode) and (req.num_computed_tokens + num_scheduled_tokens >= req.num_prompt_tokens)
-            if is_last_chunk:
-                prompt_len = len(req.prompt_token_ids)
-                prompt_blocks = math.ceil(prompt_len / self.block_size) # 包括最后一个不满的block
-                new_blocks = self.repre_pool.allocate(prompt_blocks)
-                self.req_to_repre_blocks[req_id] = new_blocks
-                for i, b in enumerate(new_blocks):
-                    self.repre_index_cpu[prefill_offset + i] = b
-                for i, b in enumerate(req.block_ids[0]):
-                    self.block_tables_cpu[prefill_offset + i] = b
-                prefill_offset += prompt_blocks
+        with nvtx.range(f"build_sparse_meta"):
+            if isinstance(attn_metadata, dict):
+                attn_metadata = next(iter(attn_metadata.values()))
+            self.attn_metadata = attn_metadata
+            prefill_offset = 0
+            for (req_id, num_scheduled_tokens) in scheduler_output.num_scheduled_tokens.items():
+                req = requests[req_id]
+                is_decode = len(req.output_token_ids) > 0 # 抢占时不成立, FIXME
+                is_last_chunk = (not is_decode) and (req.num_computed_tokens + num_scheduled_tokens >= req.num_prompt_tokens)
+                if is_last_chunk:
+                    prompt_len = len(req.prompt_token_ids)
+                    prompt_blocks = math.ceil(prompt_len / self.block_size) # 包括最后一个不满的block
+                    new_blocks = self.repre_pool.allocate(prompt_blocks)
+                    self.req_to_repre_blocks[req_id] = new_blocks
+                    for i, b in enumerate(new_blocks):
+                        self.repre_index_cpu[prefill_offset + i] = b
+                    for i, b in enumerate(req.block_ids[0]):
+                        self.block_tables_cpu[prefill_offset + i] = b
+                    prefill_offset += prompt_blocks
 
-        if prefill_offset > 0:
-            bytes = math.ceil(prefill_offset / 8) * 8 * 4 # 对齐32bytes
-            esa_copy(self.repre_index_cpu, self.repre_index, bytes)
-            esa_copy(self.block_tables_cpu, self.block_tables, bytes)
-        self.num_blocks_need_repre = prefill_offset
+            if prefill_offset > 0:
+                bytes = math.ceil(prefill_offset / 8) * 8 * 4 # 对齐32bytes
+                esa_copy(self.repre_index_cpu, self.repre_index, bytes)
+                esa_copy(self.block_tables_cpu, self.block_tables, bytes)
+            self.num_blocks_need_repre = prefill_offset
 
     def attention_begin(
         self,
@@ -144,7 +154,7 @@ class ESA(UcmSparseBase):
         forward_context,
         phase = None,
     ) -> None:
-        pass
+        return
 
     def attention_finished(
         self,
@@ -156,10 +166,15 @@ class ESA(UcmSparseBase):
         forward_context,
         phase = None,
     ) -> None:
-        layer_id = self.get_layer_id(layer_name)
-        if self.num_blocks_need_repre > 0:
-            k_cache, _ = self.get_kv_cache(forward_context, layer_name)
-            esa_repre(k_cache.flatten(-2, -1), self.repre_cache[layer_id].flatten(-2, -1), self.block_tables[:self.num_blocks_need_repre], self.repre_index[:self.num_blocks_need_repre])
+        return
+        with nvtx.range(f"attention_finished"):
+            layer_id = self.get_layer_id(layer_name)
+            if self.num_blocks_need_repre > 0:
+                k_cache, _ = self.get_kv_cache(forward_context, layer_name)
+                esa_repre(k_cache.flatten(-2, -1), self.repre_cache[layer_id].flatten(-2, -1),
+                          self.block_tables[:self.num_blocks_need_repre], self.repre_index[:self.num_blocks_need_repre])
+                esa_scatter_copy(k_cache.flatten(-3), self.host_kv_cache[layer_id].flatten(-3),
+                                 self.block_tables[:self.num_blocks_need_repre], self.repre_index[:self.num_blocks_need_repre])
 
     def estimate_num_slots_sparsed(self, request) -> int:
         return INVALID_SLOT
